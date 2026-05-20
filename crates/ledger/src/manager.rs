@@ -50,6 +50,7 @@ use henyey_common::protocol::{
     hot_archive_supported, needs_upgrade_to_version, protocol_version_starts_from, ProtocolVersion,
 };
 use henyey_common::{BucketListDbConfig, Hash256, NetworkId};
+use henyey_tx::envelope_utils::envelope_operation_count;
 use henyey_tx::soroban::PersistentModuleCache;
 use henyey_tx::{ClassicEventConfig, LedgerContext, TxEventManager};
 use parking_lot::{Mutex, RwLock};
@@ -4242,10 +4243,13 @@ impl LedgerCloseContext<'_> {
         // Update stats
         let tx_count = tx_set_result.results.len();
         let success_count = tx_set_result.results.iter().filter(|r| r.success).count();
-        let op_count: usize = tx_set_result
-            .results
+        // Count ops from envelope operation lists (not execution results), mirroring
+        // stellar-core's `txSet.sizeOpTotal()`. Pre-execution-rejected txs (TxBadSeq,
+        // TxBadAuth, etc.) have zero operation_results but still contribute ops.
+        let op_count: usize = prepared
+            .all_txs
             .iter()
-            .map(|r| r.operation_results.len())
+            .map(|(env, _)| envelope_operation_count(env))
             .sum();
         let fees_collected: i64 = tx_set_result.results.iter().map(|r| r.fee_charged).sum();
 

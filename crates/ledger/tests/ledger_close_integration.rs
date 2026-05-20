@@ -1273,3 +1273,161 @@ fn test_ledger_close_eviction_meta_key_ordering_impl() {
          deleted_keys (temp data + all TTL) first, then persistent data keys"
     );
 }
+
+/// Regression test for #2842: `stellar_ledger_op_count` must count operations from
+/// tx-set envelopes (not from execution results), so pre-execution-rejected transactions
+/// still contribute their operations to the total — matching stellar-core behavior.
+///
+/// Setup: two classic transactions in a ledger:
+///   - tx1: 1 operation, valid (succeeds)
+///   - tx2: 2 operations, stale sequence number (fails with TxBadSeq before execution)
+///
+/// Expected: op_count == 3 (all envelope ops counted regardless of result).
+/// Bug behavior: op_count == 1 (only the successful tx's operation_results counted).
+#[test]
+fn test_ledger_close_counts_ops_for_pre_execution_rejected_transactions() {
+    use stellar_xdr::curr::BumpSequenceOp;
+
+    let network_id = NetworkId::testnet();
+
+    // Two distinct source accounts
+    let secret1 = SecretKey::from_seed(&[10u8; 32]);
+    let source_id1 = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+        *secret1.public_key().as_bytes(),
+    )));
+
+    let secret2 = SecretKey::from_seed(&[20u8; 32]);
+    let source_id2 = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+        *secret2.public_key().as_bytes(),
+    )));
+
+    // Build bucket list with two funded accounts.
+    // source1: seq_num=1, so valid next seq is 2
+    // source2: seq_num=5, so valid next seq is 6 (we'll use seq 3 → TxBadSeq)
+    let mut bucket_list = henyey_ledger::new_bucket_list_with_soroban_config();
+    let source_entry1 = make_source_account_entry(source_id1.clone(), 1, 100_000_000);
+    let source_entry2 = make_source_account_entry(source_id2.clone(), 5, 100_000_000);
+
+    bucket_list
+        .add_batch(
+            1,
+            25,
+            BucketListType::Live,
+            vec![source_entry1, source_entry2],
+            vec![],
+            vec![],
+        )
+        .expect("add_batch");
+
+    // Initialize LedgerManager
+    let config = LedgerManagerConfig {
+        validate_bucket_hash: false,
+        ..Default::default()
+    };
+    let ledger = LedgerManager::new("Test SDF Network ; September 2015".to_string(), config);
+    let hot_archive = HotArchiveBucketList::new();
+    let header = make_genesis_header();
+    let header_hash = compute_header_hash(&header).expect("hash");
+    ledger
+        .initialize(bucket_list, hot_archive, header, header_hash)
+        .expect("init");
+
+    // tx1: 1 operation (BumpSequence), valid seq_num=2
+    let tx1 = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret1.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![Operation {
+            source_account: None,
+            body: OperationBody::BumpSequence(BumpSequenceOp { bump_to: 10.into() }),
+        }]
+        .try_into()
+        .unwrap(),
+        ext: TransactionExt::V0,
+    };
+    let mut envelope1 = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: tx1,
+        signatures: VecM::default(),
+    });
+    let sig1 = sign_envelope(&envelope1, &secret1, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope1 {
+        env.signatures = vec![sig1].try_into().unwrap();
+    }
+
+    // tx2: 2 operations (BumpSequence x2), stale seq_num=3 (account has seq 5 → TxBadSeq)
+    let tx2 = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret2.public_key().as_bytes())),
+        fee: 200,
+        seq_num: SequenceNumber(3), // stale: account seq is 5, so next valid is 6
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![
+            Operation {
+                source_account: None,
+                body: OperationBody::BumpSequence(BumpSequenceOp { bump_to: 20.into() }),
+            },
+            Operation {
+                source_account: None,
+                body: OperationBody::BumpSequence(BumpSequenceOp { bump_to: 30.into() }),
+            },
+        ]
+        .try_into()
+        .unwrap(),
+        ext: TransactionExt::V0,
+    };
+    let mut envelope2 = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: tx2,
+        signatures: VecM::default(),
+    });
+    let sig2 = sign_envelope(&envelope2, &secret2, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope2 {
+        env.signatures = vec![sig2].try_into().unwrap();
+    }
+
+    // Close ledger with both transactions
+    let prev_hash = ledger.current_header_hash();
+    let close_data = LedgerCloseData::new(
+        1,
+        TransactionSetVariant::Classic(TransactionSet {
+            previous_ledger_hash: Hash::from(prev_hash),
+            txs: vec![envelope1, envelope2].try_into().unwrap(),
+        }),
+        100,
+        prev_hash,
+    );
+
+    let result = ledger.close_ledger(close_data, None).expect("close ledger");
+
+    // Verify tx results: 2 txs, one success, one TxBadSeq failure
+    assert_eq!(result.tx_results.len(), 2, "expected 2 transaction results");
+
+    // Find the TxBadSeq result (order-independent)
+    let has_bad_seq = result.tx_results.iter().any(|pair| {
+        use stellar_xdr::curr::TransactionResultResult;
+        matches!(&pair.result.result, TransactionResultResult::TxBadSeq)
+    });
+    assert!(has_bad_seq, "expected one TxBadSeq result");
+
+    // The key assertion: op_count must include ALL envelope operations (1 + 2 = 3),
+    // not just the ops from successfully-executed transactions.
+    assert_eq!(
+        result.stats.tx_count, 2,
+        "tx_count should include both transactions"
+    );
+    assert_eq!(
+        result.stats.tx_success_count, 1,
+        "only one transaction should succeed"
+    );
+    assert_eq!(
+        result.stats.tx_failed_count, 1,
+        "one transaction should fail"
+    );
+    assert_eq!(
+        result.stats.op_count, 3,
+        "op_count must count envelope operations (1 + 2 = 3), not just executed ops; \
+         pre-execution rejected txs (TxBadSeq) must still contribute their envelope ops \
+         to match stellar-core's txSet.sizeOpTotal() behavior"
+    );
+}
