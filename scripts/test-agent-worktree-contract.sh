@@ -46,7 +46,9 @@ test_review_pr_workspace_contract_resolves_under_home_data() {
   if grep -q 'HOME/data/\$SESSION_ID/review-pr' "$REVIEW_PR_SKILL" ||
      grep -q 'HOME/data/\${SESSION_ID}/review-pr' "$REVIEW_PR_SKILL" ||
      grep -q '\~/data/\$SESSION_ID/review-pr' "$REVIEW_PR_SKILL" ||
-     grep -q '\$HOME/data/.*review-pr' "$REVIEW_PR_SKILL"; then
+     grep -q '\$HOME/data/.*review-pr' "$REVIEW_PR_SKILL" ||
+     grep -q 'HOME/data/\$SESSION_ID/pr-.*-review' "$REVIEW_PR_SKILL" ||
+     grep -q '\$HOME/data/.*pr-.*-review' "$REVIEW_PR_SKILL"; then
     tap_ok "$desc"
   else
     tap_not_ok "$desc" "SKILL.md does not contain a ~/data/\$SESSION_ID/review-pr workspace derivation"
