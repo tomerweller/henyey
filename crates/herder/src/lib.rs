@@ -173,7 +173,8 @@ pub use persistence::{
 
 // HerderUtils
 pub use herder_utils::{
-    get_stellar_values, get_tx_set_hashes_from_envelope, to_short_string, to_short_strkey,
+    check_all_values_signed, get_stellar_values, get_tx_set_hashes_from_envelope, to_short_string,
+    to_short_strkey,
 };
 
 // LedgerCloseData

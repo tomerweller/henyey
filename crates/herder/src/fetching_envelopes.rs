@@ -1067,47 +1067,12 @@ impl FetchingEnvelopes {
     ///
     /// Parity: stellar-core rejects envelopes containing non-signed StellarValues
     /// in both nomination (votes/accepted) and ballot statements.
+    ///
+    /// Delegates to the shared helper in `herder_utils` so the same rule is
+    /// enforced identically in both the non-prevalidated path (here) and the
+    /// post-verification path (`process_verified`).
     fn check_stellar_value_signed(envelope: &ScpEnvelope) -> bool {
-        use stellar_xdr::curr::{ScpStatementPledges, StellarValue, StellarValueExt};
-
-        let values: Vec<&[u8]> = match &envelope.statement.pledges {
-            ScpStatementPledges::Nominate(nom) => {
-                // Check all voted and accepted values
-                nom.votes
-                    .iter()
-                    .chain(nom.accepted.iter())
-                    .map(|v| v.0.as_slice())
-                    .collect()
-            }
-            ScpStatementPledges::Prepare(prep) => {
-                let mut vals = vec![prep.ballot.value.0.as_slice()];
-                if let Some(ref prepared) = prep.prepared {
-                    vals.push(prepared.value.0.as_slice());
-                }
-                if let Some(ref prepared_prime) = prep.prepared_prime {
-                    vals.push(prepared_prime.value.0.as_slice());
-                }
-                vals
-            }
-            ScpStatementPledges::Confirm(conf) => vec![conf.ballot.value.0.as_slice()],
-            ScpStatementPledges::Externalize(ext) => vec![ext.commit.value.0.as_slice()],
-        };
-
-        for value_bytes in values {
-            match StellarValue::from_xdr(value_bytes, Limits::none()) {
-                Ok(sv) => {
-                    if matches!(sv.ext, StellarValueExt::Basic) {
-                        return false;
-                    }
-                }
-                Err(_) => {
-                    // Can't decode — reject
-                    return false;
-                }
-            }
-        }
-
-        true
+        crate::herder_utils::check_all_values_signed(envelope)
     }
 
     /// Extract all TxSet hashes from an envelope.

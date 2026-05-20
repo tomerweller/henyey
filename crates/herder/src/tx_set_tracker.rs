@@ -52,6 +52,11 @@ pub struct TxSetTracker {
     /// Monotonic counter for deterministic LRU eviction ordering.
     /// Relaxed ordering suffices — uniqueness is all we need.
     next_seq: AtomicU64,
+    /// Monotonic counter incremented on every successful `store` (whether
+    /// the entry was newly inserted or updated in-place). Used by the
+    /// observer trigger path to detect that a tx-set was successfully cached,
+    /// even when the cache size doesn't grow (repeated trigger for same hash).
+    store_generation: AtomicU64,
 }
 
 impl TxSetTracker {
@@ -62,6 +67,7 @@ impl TxSetTracker {
             valid_cache: Mutex::new(RandomEvictionCache::new(TXSET_VALID_CACHE_SIZE)),
             max_cache_size,
             next_seq: AtomicU64::new(0),
+            store_generation: AtomicU64::new(0),
         }
     }
 
@@ -220,6 +226,12 @@ impl TxSetTracker {
                 }
             }
         }
+
+        // Bump generation on every successful store (new insert OR in-place
+        // update). The observer trigger path uses this to detect that the
+        // build+cache pipeline succeeded, even for repeated triggers where
+        // the same hash is re-stored without growing the cache.
+        self.store_generation.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Receive a parsed tx set from the network. Verifies hash integrity,
@@ -360,6 +372,14 @@ impl TxSetTracker {
 
     pub fn cache_count(&self) -> usize {
         self.cache.len()
+    }
+
+    /// Monotonic generation counter — incremented on every successful `store`.
+    /// Unlike `cache_count`, this grows even when an existing entry is
+    /// overwritten in place, making it suitable for detecting that a
+    /// build+cache cycle completed (regardless of whether the hash was new).
+    pub fn store_generation(&self) -> u64 {
+        self.store_generation.load(Ordering::Relaxed)
     }
 
     pub fn pending_count(&self) -> usize {

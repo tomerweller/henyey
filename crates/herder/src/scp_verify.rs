@@ -331,12 +331,14 @@ pub enum PostVerifyReason {
     PendingAddPerSlotFull = 12,
     Accepted = 13,
     GateDriftManualClose = 14,
+    /// Inner StellarValue failed to decode or uses Basic (non-SIGNED) ext.
+    InvalidInnerValue = 15,
 }
 
 impl PostVerifyReason {
     /// All variants in discriminant order. This is the single source of truth
     /// for iteration, counter allocation, and Prometheus label generation.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::InvalidSignature,
         Self::PanicVerdict,
         Self::GateDriftRange,
@@ -352,6 +354,7 @@ impl PostVerifyReason {
         Self::PendingAddPerSlotFull,
         Self::Accepted,
         Self::GateDriftManualClose,
+        Self::InvalidInnerValue,
     ];
 
     /// Prometheus metric label for this reason.
@@ -372,6 +375,7 @@ impl PostVerifyReason {
             Self::PendingAddPerSlotFull => "per_slot_full",
             Self::Accepted => "accepted",
             Self::GateDriftManualClose => "drift_manual_close",
+            Self::InvalidInnerValue => "invalid_inner_value",
         }
     }
 }
@@ -384,7 +388,7 @@ const _: () = {
         i += 1;
     }
     // Last discriminant + 1 == ALL.len() — catches a variant added but not in ALL.
-    assert!(PostVerifyReason::ALL.len() == PostVerifyReason::GateDriftManualClose as usize + 1);
+    assert!(PostVerifyReason::ALL.len() == PostVerifyReason::InvalidInnerValue as usize + 1);
 };
 
 /// Fixed-size counter array indexed by [`PostVerifyReason`].

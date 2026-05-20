@@ -2,10 +2,10 @@
 
 **Spec version:** 26 (stellar-core v26.0.1 / Protocol 26)
 **Crate:** crates/herder
-**Last updated:** 2026-05-13
-**Overall adherence:** 86%
+**Last updated:** 2026-05-20
+**Overall adherence:** 93%
 
-**Tally:** Full 51 | Partial 7 | Absent 1 | Drift 2 | N/A 4
+**Tally:** Full 55 | Partial 3 | Absent 1 | Drift 2 | N/A 4
 
 Adherence percentage is computed as `Full / (Full + Partial + Absent) × 100` over
 normative-strong claims (MUST/SHALL/MUST NOT/SHALL NOT). Drift and N/A items
@@ -21,7 +21,7 @@ excluded. SHOULD claims and operational defaults excluded.
 | §4 | State machine transitions | Full | state.rs:82 + herder.rs:980 |
 | §4 | INV: BOOTING regression forbidden | Full | state.rs:82-88 |
 | §4 | trackingConsensusLedgerIndex >= LCL | Full | herder.rs:1066 (corrective; deviation) |
-| §5.1 | Trigger setup preconditions | Partial | herder.rs:2399-2444 (lcl_matches_slot only) |
+| §5.1 | Trigger setup preconditions | Full | herder.rs:2399-2477 (lcl_matches_slot + tracking; observer path builds without nominating) |
 | §5.1 | ctValidityOffset adjustment of trigger time | Absent | not found |
 | §5.1 | MANUAL_CLOSE skips trigger | Full | herder.rs:1758 (suppress_scp gate) |
 | §5.2 | triggerNextLedger pipeline | Full | herder.rs:2399 + build_nomination_value |
@@ -29,7 +29,7 @@ excluded. SHOULD claims and operational defaults excluded.
 | §5.2 | ctValidityOffset abort on far-ahead clock | Drift | guarded only by `>= UNIX_EPOCH` + monotonic clamp |
 | §5.2 | Cache tx set valid + ban invalid | Full | herder.rs:3054 + tx_set_tracker.rs |
 | §5.2 | Drop oversized upgrades | Full | herder.rs:3155-3172 |
-| §5.2 | Non-validator builds + caches | Partial | trigger_next_ledger requires is_validator |
+| §5.2 | Non-validator builds + caches | Full | trigger_next_ledger observer path builds/caches tx-set via build_nomination_value side-effect |
 | §5.3 | Externalize handler (Latest vs Older) | Full | scp_driver.rs:value_externalized → herder.rs |
 | §5.3 | SCP history persistence ordering | Partial | persistence.rs (no explicit prev-slot-first) |
 | §5.4 | computeTimeout formula | Full | scp_driver.rs:3709-3735 |
@@ -65,8 +65,8 @@ excluded. SHOULD claims and operational defaults excluded.
 | §11 | combineCandidates: upgrade merge by type | Full | scp_driver.rs:1918-1939, 2021-2034 |
 | §11 | combineCandidates: signature carry-over | Partial | uses selected candidate's full SV (deviation: defensive fallback when no candidate matches LCL) |
 | §12.1 | One tx per source account | Full | tx_queue/mod.rs::check_account_limit |
-| §12.2 | Reception pipeline order | Partial | order largely preserved; ban check inlined post-store-lock TOCTOU re-check |
-| §12.2 | Cross-queue source check | Partial | spec puts it at top of HerderImpl.recvTransaction; henyey enforces inside try_add (regression test #1934) |
+| §12.2 | Reception pipeline order | Full | ban check inlined post-store-lock TOCTOU re-check; cross-type precheck atomic inside try_add |
+| §12.2 | Cross-queue source check | Full | tx_queue/mod.rs:try_add atomic has_cross_type_conflict precheck before fee validation (no TOCTOU) |
 | §12.3 | Replace-by-fee FEE_MULTIPLIER × per-op | Full | tx_queue/mod.rs:606, 663 (FEE_MULTIPLIER = 10) |
 | §12.4 | shift() ban deque + age + auto-ban | Full | tx_queue/mod.rs:2761 (TIMEOUT=4, BAN=10) |
 | §12.4 | removeApplied semantics | Full | tx_queue/mod.rs:2654 |
@@ -83,7 +83,7 @@ excluded. SHOULD claims and operational defaults excluded.
 | §14.2 | Rebroadcast after ledger close | Full | tx_queue/mod.rs (flood reset on shift) |
 | §15.1 | recvSCPEnvelope pre-filter chain | Full | herder.rs:1751-1836 + scp_verify.rs |
 | §15.1 | Skip-self + non-quorum reject | Full | herder.rs:1906-1925 |
-| §15.1 | StellarValue parse + SIGNED check | Partial | scp_driver.rs:1392 (full); pre-fetch path parses w/o re-check |
+| §15.1 | StellarValue parse + SIGNED check | Full | shared check_all_values_signed helper enforced in both recv_envelope and process_verified before prefetch |
 | §15.2 | ItemFetcher get/peerDoesntHave | Full | fetching_envelopes.rs |
 | §15.2 | Broadcast onward after fetch | Full | fetching_envelopes.rs:280-286 |
 | §15.3 | Out-of-sync recovery loop | Full | sync_recovery.rs |
@@ -103,7 +103,7 @@ excluded. SHOULD claims and operational defaults excluded.
 | §16.7 | maybeHandleUpgrade post-close | Drift | flow_control.rs caches max_tx_size, but no explicit peer notify-on-increase path in this crate |
 | §17 | INV-H1 Tracking monotonicity | Full | state.rs:82 + herder.rs:980 |
 | §17 | INV-H2 LCL ≤ tracking | Full | herder.rs:1066-1096 (corrective deviation, see notes) |
-| §17 | INV-H3 Single in-flight tx per source | Full | herder.rs::receive_transaction cross-queue check + tx_queue per-account |
+| §17 | INV-H3 Single in-flight tx per source | Full | tx_queue::try_add cross-type check + tx_queue per-account |
 | §17 | INV-H4 Tx set determinism | Full | hash on canonical wire form (tx_queue/tx_set.rs) |
 | §17 | INV-H5 StellarValue close-time monotonicity | Full | scp_driver.rs:1198-1226 (check_close_time) |
 | §17 | INV-H6 Upgrade ordering | Full | scp_driver.rs:1563-1584 |
@@ -430,12 +430,13 @@ excluded. SHOULD claims and operational defaults excluded.
     filter → fee bound → existing source/replace-by-fee → queue limiter →
     overlay validity → fee balance.
   - **Sub-claim §12.2-1 (cross-queue source check)**: Spec places this at
-    the *top* of `HerderImpl.recvTransaction`. In henyey,
-    `Herder::receive_transaction` (`herder.rs:2324`) delegates to the
-    correct queue; the cross-queue source-account check is then performed
-    inside `try_add` rather than as a top-level pre-check. Regression test
+    the *top* of `HerderImpl.recvTransaction`. In henyey, the cross-type
+    source-account check (`has_cross_type_conflict`) is performed atomically
+    inside `tx_queue/mod.rs::try_add` before fee validation, guaranteeing
+    "cross-type conflict beats fee gate" ordering without a TOCTOU race
+    between a standalone precheck and the queue add. Regression test
     coverage: #1934.
-    - **Status:** Partial.
+    - **Status:** Full.
   - **Sub-claim §12.2-3 (ban check before filter)**: Henyey performs the
     ban check (`is_banned`) before the filter check at line 2090; matches
     spec.
@@ -676,7 +677,7 @@ excluded. SHOULD claims and operational defaults excluded.
 |-----------|--------|-------------|
 | INV-H1 (Tracking monotonicity) | Full | `state.rs:82` matrix + `herder.rs:980` `set_state` |
 | INV-H2 (LCL ≤ tracking) | Full | `herder.rs:1066` `assert_lcl_consistency` (corrective deviation; counter exposed) |
-| INV-H3 (Single in-flight tx per source) | Full | `herder.rs::receive_transaction` cross-queue check + `tx_queue` per-account state |
+| INV-H3 (Single in-flight tx per source) | Full | `tx_queue::try_add` cross-type check + `tx_queue` per-account state |
 | INV-H4 (Tx set determinism) | Full | wire-form hash via `tx_queue/tx_set.rs::recompute_hash`; surge seed sourced from `mBroadcastSeed` |
 | INV-H5 (StellarValue close-time monotonicity) | Full | `scp_driver.rs:1198-1226 check_close_time` |
 | INV-H6 (Upgrade ordering) | Full | `scp_driver.rs:1563-1584 check_upgrade_ordering` + `herder.rs:3142-3150` sort-on-build |
@@ -753,10 +754,10 @@ sections present in the current spec:
    so reviewers understand the spec calls it fatal but henyey treats it
    as recoverable.
 
-4. **Audit cross-queue source-account check ordering** (§12.2-1). Spec
-   wants it at the top of `recvTransaction`; henyey runs it inside
-   `try_add`. Verify there is no behavioural divergence under fee-bump
-   churn.
+4. ~~**Audit cross-queue source-account check ordering** (§12.2-1).~~
+   Resolved: the check lives atomically inside `try_add` before fee
+   validation. No TOCTOU vs. the spec's top-of-`recvTransaction` placement
+   because henyey holds the queue lock for the entire admission path.
 
 5. **Verify §15.3 random-peer ask path** is wired in the overlay /
    sync_recovery integration; the herder side only exposes the slot

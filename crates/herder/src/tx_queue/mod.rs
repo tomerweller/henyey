@@ -76,7 +76,7 @@ pub(crate) mod flood_queue;
 mod selection;
 mod tx_set;
 
-pub(crate) use selection::{BuildContext, NominationBuildContext};
+pub(crate) use selection::{BuildContext, BuildOutput, NominationBuildContext};
 pub use tx_set::*;
 
 /// Result of attempting to add a transaction to the queue.
@@ -1736,6 +1736,31 @@ impl TransactionQueue {
         Ok(())
     }
 
+    /// Check whether the given envelope's source account already has a pending
+    /// transaction of the opposite type (classic vs soroban).
+    ///
+    /// This is a thin top-level precheck for §12.2 ordering: a conflicting
+    /// cross-type tx should return `TryAgainLater` BEFORE any fee validation
+    /// can surface a different result. The authoritative cross-type rejection
+    /// remains inside `check_account_limit` as defense-in-depth.
+    ///
+    /// Parity: mirrors the narrow top-level gate in stellar-core
+    /// `HerderImpl::recvTransaction` (HerderImpl.cpp:627-642).
+    pub(crate) fn has_cross_type_conflict(&self, envelope: &TransactionEnvelope) -> bool {
+        let candidate_is_soroban = henyey_tx::envelope_utils::is_soroban_envelope(envelope);
+        let seq_source_key = account_key(envelope);
+
+        let account_states = self.account_states.read();
+        if let Some(state) = account_states.get(&seq_source_key) {
+            if let Some(ref current_tx) = state.transaction {
+                let current_is_soroban =
+                    henyey_tx::envelope_utils::is_soroban_envelope(&current_tx.envelope);
+                return current_is_soroban != candidate_is_soroban;
+            }
+        }
+        false
+    }
+
     /// Check per-account limit: one pending transaction per sequence-number source.
     ///
     /// Returns `Ok(None)` if no existing transaction, `Ok(Some(replaced))` if a
@@ -2063,6 +2088,21 @@ impl TransactionQueue {
 
     /// Try to add a transaction to the queue.
     pub fn try_add(&self, envelope: TransactionEnvelope) -> TxQueueResult {
+        // Parity: §12.2 cross-type source-account precheck. If the account
+        // already has a pending tx of the opposite type (classic vs soroban),
+        // reject with TryAgainLater BEFORE any validation or fee check can
+        // surface a different result (FeeTooLow, Invalid). This restores the
+        // externally visible reception pipeline ordering from stellar-core's
+        // HerderImpl::recvTransaction (HerderImpl.cpp:627-642).
+        //
+        // This check is inside try_add (not a standalone call from
+        // receive_transaction) so that no TOCTOU race can occur between
+        // the cross-type read and the authoritative queue-local check in
+        // check_account_limit. The queue-local check remains as defense-in-depth.
+        if self.has_cross_type_conflict(&envelope) {
+            return TxQueueResult::TryAgainLater;
+        }
+
         // Validate transaction before queueing
         if let Err(code) = self.validate_transaction(&envelope) {
             return TxQueueResult::Invalid(Some(code));
@@ -8329,15 +8369,17 @@ mod snapshot_providers_tests {
         let account_provider = CountingAccountProvider::new();
 
         // Build tx set with override providers — should NOT panic.
-        let _tx_set = queue.build_generalized_tx_set_with_providers(
-            crate::tx_queue::selection::BuildContext::Queue,
-            Hash256::ZERO,
-            100,
-            None,
-            0,
-            Some(&fee_provider),
-            Some(&account_provider),
-        );
+        let _tx_set = queue
+            .build_generalized_tx_set_with_providers(
+                crate::tx_queue::selection::BuildContext::Queue,
+                Hash256::ZERO,
+                100,
+                None,
+                0,
+                Some(&fee_provider),
+                Some(&account_provider),
+            )
+            .tx_set;
 
         // The override providers should have been called (at least once
         // per source account for the fee provider during trim_invalid).
@@ -8363,15 +8405,17 @@ mod snapshot_providers_tests {
         }
 
         // Build without override — should use queue's stored providers.
-        let _tx_set = queue.build_generalized_tx_set_with_providers(
-            crate::tx_queue::selection::BuildContext::Queue,
-            Hash256::ZERO,
-            100,
-            None,
-            0,
-            None,
-            None,
-        );
+        let _tx_set = queue
+            .build_generalized_tx_set_with_providers(
+                crate::tx_queue::selection::BuildContext::Queue,
+                Hash256::ZERO,
+                100,
+                None,
+                0,
+                None,
+                None,
+            )
+            .tx_set;
 
         assert!(
             counting_fee.calls() > 0 || counting_account.calls() > 0,

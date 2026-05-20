@@ -2253,7 +2253,8 @@ impl App {
 
         match outcome {
             henyey_herder::TriggerOutcome::Triggered
-            | henyey_herder::TriggerOutcome::AlreadyNominating => Ok(next_ledger),
+            | henyey_herder::TriggerOutcome::AlreadyNominating
+            | henyey_herder::TriggerOutcome::ObserverBuilt => Ok(next_ledger),
             henyey_herder::TriggerOutcome::SkippedStale => Err(anyhow::anyhow!(
                 "manual close: LCL advanced during build_nomination_value; \
                  caller should retry with refreshed ledger seq"
