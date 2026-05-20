@@ -901,7 +901,21 @@ impl Herder {
         let restored = manager.restore_scp_state().expect(
             "SCP state restore failed: persistence read error is fatal (parity: stellar-core)",
         );
-        self.apply_restored_scp_state(restored);
+        // Provide a DB fallback closure for loading qsets from `scpquorums`
+        // during quorum tracker rebuild. Mirrors stellar-core's
+        // `PendingEnvelopes::getQSet()` which falls back to
+        // `HerderPersistence::getQuorumSet(db, hash)`.
+        let storage = manager.storage();
+        let db_qset_loader = |hash: &stellar_xdr::curr::Hash| -> Option<ScpQuorumSet> {
+            match storage.load_scp_quorum_set(hash) {
+                Ok(opt) => opt,
+                Err(e) => {
+                    warn!(error = %e, "Failed to load quorum set from scpquorums during restore");
+                    None
+                }
+            }
+        };
+        self.apply_restored_scp_state(restored, Some(&db_qset_loader));
     }
 
     /// Apply restored SCP state from persistence on startup.
@@ -910,10 +924,19 @@ impl Herder {
     /// `HerderImpl::restoreSCPState()` (HerderImpl.cpp:2189-2261):
     ///
     /// 1. Tx sets — decode and cache each one
-    /// 2. Quorum sets — store by hash and seed FetchingEnvelopes cache
+    /// 2. Quorum sets — validate sanity, store by hash, seed FetchingEnvelopes
     /// 3. SCP envelopes — restore SCP slot state + associate node→qset
     /// 4. Rebuild quorum tracker (called once at end; idempotent)
-    pub fn apply_restored_scp_state(&self, state: crate::persistence::RestoredScpState) {
+    ///
+    /// The optional `db_qset_loader` closure is used in step 4 to fall back to
+    /// loading quorum sets from `scpquorums` when they aren't in memory.
+    /// Mirrors stellar-core's `PendingEnvelopes::getQSet()` DB fallback.
+    #[allow(clippy::type_complexity)]
+    pub fn apply_restored_scp_state(
+        &self,
+        state: crate::persistence::RestoredScpState,
+        db_qset_loader: Option<&dyn Fn(&stellar_xdr::curr::Hash) -> Option<ScpQuorumSet>>,
+    ) {
         // Step 1: Tx sets — decode from XDR bytes and cache.
         let mut tx_sets_loaded = 0u32;
         for (hash, bytes) in &state.tx_sets {
@@ -941,13 +964,23 @@ impl Herder {
             }
         }
 
-        // Step 2: Quorum sets — store by hash in the ScpDriver's quorum set
-        // tracker and seed the FetchingEnvelopes cache directly.
-        // `recv_quorum_set` cannot be used here because on startup there are no
-        // outstanding fetches, so restored qsets would be rejected at the
-        // `is_tracking` guard (fetching_envelopes.rs:514).
+        // Step 2: Quorum sets — validate sanity, store by hash in the
+        // ScpDriver's quorum set tracker and seed the FetchingEnvelopes cache.
+        // Parity: stellar-core's `addSCPQuorumSet()` routes restored qsets
+        // through `putQSet()` which calls `releaseAssert(isQuorumSetSane(...))`
+        // (PendingEnvelopes.cpp:99-104). An insane qset in persistence
+        // indicates DB corruption; panic matches upstream abort semantics.
         let mut qsets_loaded = 0u32;
         for (hash, qs) in &state.quorum_sets {
+            if let Err(reason) = henyey_scp::is_quorum_set_sane(qs, false) {
+                panic!(
+                    "Restored quorum set {} is insane: {}. \
+                     Parity: stellar-core releaseAssert(isQuorumSetSane) in putQSet(). \
+                     This indicates database corruption.",
+                    hex::encode(hash.0),
+                    reason
+                );
+            }
             let h256 = Hash256::from(hash.clone());
             self.scp_driver.store_quorum_set_by_hash(h256, qs.clone());
             self.fetching_envelopes.seed_quorum_set(h256, qs.clone());
@@ -989,8 +1022,20 @@ impl Herder {
             for node_id in &node_ids {
                 if let Some(latest_env) = self.scp.get_latest_message(node_id) {
                     if let Some(qset_hash) = crate::persistence::get_quorum_set_hash(&latest_env) {
-                        let h256 = Hash256::from(qset_hash);
-                        if let Some(qs) = self.scp_driver.get_quorum_set_by_hash(&h256) {
+                        let h256 = Hash256::from(qset_hash.clone());
+                        let qs = self.scp_driver.get_quorum_set_by_hash(&h256).or_else(|| {
+                            // Fallback: load from `scpquorums` table. Mirrors
+                            // stellar-core's PendingEnvelopes::getQSet() which
+                            // falls back to HerderPersistence::getQuorumSet().
+                            let loaded = db_qset_loader.and_then(|f| f(&qset_hash))?;
+                            // Cache in memory for subsequent lookups.
+                            self.scp_driver
+                                .store_quorum_set_by_hash(h256, loaded.clone());
+                            self.fetching_envelopes
+                                .seed_quorum_set(h256, loaded.clone());
+                            Some(loaded)
+                        });
+                        if let Some(qs) = qs {
                             self.scp_driver.store_quorum_set(node_id, qs);
                         }
                     }
@@ -1003,12 +1048,25 @@ impl Herder {
                     return Some(qs);
                 }
 
+                // Fallback: use `quoruminfo` to find the node's qset hash,
+                // then look up the qset by hash (in-memory first, then DB).
+                // Mirrors stellar-core's rebuildQuorumTrackerState() fallback
+                // to HerderPersistence::getNodeQuorumSet() + getQSet().
                 let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(node_key) = &id.0;
                 let node_id_str = stellar_strkey::ed25519::PublicKey(node_key.0).to_string();
                 let hash_hex = quorum_info_map.get(&node_id_str)?;
                 let hash_bytes: [u8; 32] = hex::decode(hash_hex).ok()?.try_into().ok()?;
-                self.scp_driver
-                    .get_quorum_set_by_hash(&Hash256::from_bytes(hash_bytes))
+                let h256 = Hash256::from_bytes(hash_bytes);
+                let xdr_hash = stellar_xdr::curr::Hash(hash_bytes);
+
+                self.scp_driver.get_quorum_set_by_hash(&h256).or_else(|| {
+                    let loaded = db_qset_loader.and_then(|f| f(&xdr_hash))?;
+                    self.scp_driver
+                        .store_quorum_set_by_hash(h256, loaded.clone());
+                    self.fetching_envelopes
+                        .seed_quorum_set(h256, loaded.clone());
+                    Some(loaded)
+                })
             }) {
                 warn!(error = %err, "Failed to rebuild quorum tracker after SCP state restore");
             }
@@ -13338,7 +13396,7 @@ mod restore_scp_state_tests {
             quorum_info: vec![],
         };
 
-        herder.apply_restored_scp_state(restored);
+        herder.apply_restored_scp_state(restored, None);
 
         // Use get_entire_current_state which includes self even when not fully_validated.
         let envelopes = herder.scp.get_entire_current_state(slot);
@@ -13374,7 +13432,7 @@ mod restore_scp_state_tests {
             quorum_info: vec![],
         };
 
-        herder.apply_restored_scp_state(restored);
+        herder.apply_restored_scp_state(restored, None);
 
         let found = herder.scp_driver.get_quorum_set_by_hash(&hash);
         assert!(found.is_some(), "Quorum set should be cached after restore");
@@ -13399,7 +13457,7 @@ mod restore_scp_state_tests {
             quorum_info: vec![],
         };
 
-        herder.apply_restored_scp_state(restored);
+        herder.apply_restored_scp_state(restored, None);
 
         assert!(
             herder.scp_driver.has_tx_set_and_touch(&tx_set_hash),
@@ -13431,7 +13489,7 @@ mod restore_scp_state_tests {
         };
 
         // Should not panic — corrupt entry is skipped.
-        herder.apply_restored_scp_state(restored);
+        herder.apply_restored_scp_state(restored, None);
 
         assert!(
             herder.scp_driver.has_tx_set_and_touch(&tx_set_hash),
@@ -13472,7 +13530,7 @@ mod restore_scp_state_tests {
             quorum_sets: vec![(xdr_hash.clone(), qs)],
             quorum_info: vec![],
         };
-        herder.apply_restored_scp_state(restored);
+        herder.apply_restored_scp_state(restored, None);
 
         // Now create a Nominate envelope referencing the restored qset hash.
         // Use empty votes so no tx set dependency is triggered.
@@ -13544,15 +13602,18 @@ mod restore_scp_state_tests {
         };
 
         let remote_node_str = stellar_strkey::ed25519::PublicKey([42u8; 32]).to_string();
-        herder.apply_restored_scp_state(RestoredScpState {
-            envelopes: vec![(7, local_env)],
-            tx_sets: vec![],
-            quorum_sets: vec![
-                (stellar_xdr::curr::Hash(local_qs_hash.0), local_qs.clone()),
-                (stellar_xdr::curr::Hash(remote_qs_hash.0), remote_qs.clone()),
-            ],
-            quorum_info: vec![(remote_node_str, hex::encode(remote_qs_hash.0))],
-        });
+        herder.apply_restored_scp_state(
+            RestoredScpState {
+                envelopes: vec![(7, local_env)],
+                tx_sets: vec![],
+                quorum_sets: vec![
+                    (stellar_xdr::curr::Hash(local_qs_hash.0), local_qs.clone()),
+                    (stellar_xdr::curr::Hash(remote_qs_hash.0), remote_qs.clone()),
+                ],
+                quorum_info: vec![(remote_node_str, hex::encode(remote_qs_hash.0))],
+            },
+            None,
+        );
 
         let tracker = herder.quorum_tracker.read();
         assert!(
@@ -13725,6 +13786,139 @@ mod restore_scp_state_tests {
             envelopes_11.len(),
             0,
             "Corrupt slot 11 should be entirely skipped"
+        );
+    }
+
+    /// Parity test: restoring an insane-but-XDR-decodable quorum set should
+    /// panic. Mirrors stellar-core's `releaseAssert(isQuorumSetSane(...))` in
+    /// `putQSet()` (PendingEnvelopes.cpp:104).
+    #[test]
+    #[should_panic(expected = "Restored quorum set")]
+    fn test_apply_restored_scp_state_panics_on_insane_quorum_set() {
+        let herder = make_test_herder();
+
+        // An insane quorum set: threshold > number of validators + inner sets.
+        let insane_qs = ScpQuorumSet {
+            threshold: 99, // impossible threshold
+            validators: vec![XdrNodeId(
+                stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])),
+            )]
+            .try_into()
+            .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let hash = hash_quorum_set(&insane_qs);
+        let xdr_hash = stellar_xdr::curr::Hash(hash.0);
+
+        let restored = RestoredScpState {
+            envelopes: vec![],
+            tx_sets: vec![],
+            quorum_sets: vec![(xdr_hash, insane_qs)],
+            quorum_info: vec![],
+        };
+
+        // This should panic because the quorum set is insane.
+        herder.apply_restored_scp_state(restored, None);
+    }
+
+    /// Correctness test: during quorum tracker rebuild, if a quorum set hash
+    /// from `quoruminfo` is NOT present in the restored slot state, the restore
+    /// path should fall back to loading it from the DB via `db_qset_loader`.
+    #[test]
+    fn test_apply_restored_scp_state_db_fallback_for_missing_quorum_set() {
+        let herder = make_test_herder();
+
+        // Create a local envelope for SCP state restore.
+        let local_node_id = herder.scp.local_node_id().clone();
+        // Create a remote node whose qset is NOT in restored slot state
+        // but IS available via the DB fallback.
+        let remote_node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            Uint256([42u8; 32]),
+        ));
+        let remote_qs = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![remote_node_id.clone()].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let remote_qs_hash = hash_quorum_set(&remote_qs);
+
+        // Local qset includes the remote node so rebuild() traverses to it.
+        let local_qs = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![local_node_id.clone(), remote_node_id.clone()]
+                .try_into()
+                .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let local_qs_hash = hash_quorum_set(&local_qs);
+
+        // Build a local envelope that references the local qset.
+        let local_env = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: local_node_id.clone(),
+                slot_index: 7,
+                pledges: ScpStatementPledges::Nominate(stellar_xdr::curr::ScpNomination {
+                    quorum_set_hash: stellar_xdr::curr::Hash(local_qs_hash.0),
+                    votes: vec![].try_into().unwrap(),
+                    accepted: vec![].try_into().unwrap(),
+                }),
+            },
+            signature: stellar_xdr::curr::Signature::default(),
+        };
+
+        // Build a remote envelope that references the remote qset.
+        let remote_env = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: remote_node_id.clone(),
+                slot_index: 7,
+                pledges: ScpStatementPledges::Nominate(stellar_xdr::curr::ScpNomination {
+                    quorum_set_hash: stellar_xdr::curr::Hash(remote_qs_hash.0),
+                    votes: vec![].try_into().unwrap(),
+                    accepted: vec![].try_into().unwrap(),
+                }),
+            },
+            signature: stellar_xdr::curr::Signature::default(),
+        };
+
+        let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(remote_key) = &remote_node_id.0;
+        let remote_node_str = stellar_strkey::ed25519::PublicKey(remote_key.0).to_string();
+
+        // Restored state: only local qset in slot state. Remote qset is NOT
+        // in quorum_sets — it's only reachable via the DB loader.
+        let restored = RestoredScpState {
+            envelopes: vec![(7, local_env), (7, remote_env)],
+            tx_sets: vec![],
+            quorum_sets: vec![(stellar_xdr::curr::Hash(local_qs_hash.0), local_qs.clone())],
+            quorum_info: vec![(remote_node_str, hex::encode(remote_qs_hash.0))],
+        };
+
+        // Provide a DB fallback that returns the remote qset.
+        let remote_qs_clone = remote_qs.clone();
+        let expected_hash = remote_qs_hash;
+        let db_loader = move |hash: &stellar_xdr::curr::Hash| -> Option<ScpQuorumSet> {
+            if hash.0 == expected_hash.0 {
+                Some(remote_qs_clone.clone())
+            } else {
+                None
+            }
+        };
+
+        herder.apply_restored_scp_state(restored, Some(&db_loader));
+
+        // The remote node's qset should now be cached via the DB fallback.
+        assert!(
+            herder
+                .scp_driver
+                .get_quorum_set_by_hash(&remote_qs_hash)
+                .is_some(),
+            "Remote qset should be loaded from DB fallback and cached"
+        );
+
+        // The quorum tracker should know about the remote node.
+        let tracker = herder.quorum_tracker.read();
+        assert!(
+            tracker.is_node_definitely_in_quorum(&remote_node_id),
+            "Remote node should be tracked after DB fallback resolves its qset"
         );
     }
 }

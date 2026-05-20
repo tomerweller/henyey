@@ -67,6 +67,19 @@ impl Database {
         })
     }
 
+    /// Saves node→quorum-set-hash associations to the `quoruminfo` table.
+    ///
+    /// Mirrors stellar-core's `saveSCPHistory()` which persists the full
+    /// `QuorumTracker::QuorumMap` to `quoruminfo` at each ledger close.
+    /// This ensures remote validators' quorum-set associations survive
+    /// restarts (not just the local node's).
+    pub fn save_quorum_info(&self, entries: &[(String, String)]) -> Result<()> {
+        self.with_connection(|conn| {
+            use queries::ScpStatePersistenceQueries;
+            conn.save_quorum_info(entries)
+        })
+    }
+
     /// Stores bucket list snapshot levels for a ledger.
     ///
     /// The bucket list is a Merkle tree structure that stores all ledger entries.

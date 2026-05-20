@@ -117,6 +117,20 @@ impl SqliteScpPersistence {
         self.with_connection(|conn| conn.load_all_quorum_info())
     }
 
+    /// Load a quorum set from `scpquorums` by its hash.
+    ///
+    /// Used as a fallback during SCP state restore when a quorum set referenced
+    /// by `quoruminfo` is not present in the restored slot state.
+    pub fn load_scp_quorum_set(
+        &self,
+        hash: &henyey_common::Hash256,
+    ) -> Result<Option<stellar_xdr::curr::ScpQuorumSet>, String> {
+        self.with_connection(|conn| {
+            use crate::queries::ScpQueries;
+            conn.load_scp_quorum_set(hash)
+        })
+    }
+
     /// Atomic purge of unreferenced persisted transaction sets.
     ///
     /// Wraps the three-step purge (read hashes, read SCP states, delete

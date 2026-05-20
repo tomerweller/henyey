@@ -199,6 +199,22 @@ pub trait ScpStatePersistence: Send + Sync {
         Ok(vec![])
     }
 
+    /// Load a quorum set from the `scpquorums` table by its hash.
+    ///
+    /// Used during restore as a fallback when a quorum set referenced by
+    /// `quoruminfo` is not present in the restored slot state. Mirrors
+    /// stellar-core's `HerderPersistence::getQuorumSet()` which loads from
+    /// `scpquorums` during `rebuildQuorumTrackerState()`.
+    ///
+    /// Default returns `None` (in-memory backends don't have a separate qset table).
+    fn load_scp_quorum_set(
+        &self,
+        hash: &stellar_xdr::curr::Hash,
+    ) -> Result<Option<stellar_xdr::curr::ScpQuorumSet>> {
+        let _ = hash;
+        Ok(None)
+    }
+
     /// Atomic purge of unreferenced persisted transaction sets.
     ///
     /// Implementations that have transactional storage (e.g. SQLite) should
@@ -475,6 +491,14 @@ impl ScpPersistenceManager {
     /// store. Primarily used by tests to assert post-purge state.
     pub fn has_tx_set(&self, hash: &Hash) -> Result<bool> {
         self.storage.has_tx_set(hash)
+    }
+
+    /// Access the underlying storage backend.
+    ///
+    /// Used during restore to provide a DB fallback for loading quorum sets
+    /// from `scpquorums` that aren't in the restored slot state.
+    pub fn storage(&self) -> &dyn ScpStatePersistence {
+        &*self.storage
     }
 
     /// Increment the pending-persist counter. Called by the emit callback's
@@ -1227,6 +1251,17 @@ impl ScpStatePersistence for SqliteScpPersistence {
     fn load_all_quorum_info(&self) -> Result<Vec<(String, String)>> {
         self.inner
             .load_all_quorum_info()
+            .map_err(HerderError::Internal)
+    }
+
+    fn load_scp_quorum_set(
+        &self,
+        hash: &stellar_xdr::curr::Hash,
+    ) -> Result<Option<stellar_xdr::curr::ScpQuorumSet>> {
+        use henyey_common::Hash256;
+        let h256 = Hash256::from_bytes(hash.0);
+        self.inner
+            .load_scp_quorum_set(&h256)
             .map_err(HerderError::Internal)
     }
 

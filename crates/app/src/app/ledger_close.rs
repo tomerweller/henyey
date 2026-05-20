@@ -217,6 +217,24 @@ impl LedgerPersistInputs {
                 conn.store_scp_quorum_set(hash, self.header.ledger_seq, qset)?;
             }
 
+            // Persist node→qset_hash associations from ALL consensus
+            // envelopes to `quoruminfo`. Mirrors stellar-core's
+            // `saveSCPHistory()` which writes the full QuorumMap (not just
+            // local-node state). This ensures remote validators' associations
+            // survive restarts and are available to `rebuildQuorumTrackerState`.
+            if !self.scp_envelopes.is_empty() {
+                let mut quorum_info = std::collections::HashMap::new();
+                for envelope in &self.scp_envelopes {
+                    let qset_hash = henyey_common::scp_quorum_set_hash(&envelope.statement);
+                    let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(node_key) =
+                        &envelope.statement.node_id.0;
+                    let node_id = stellar_strkey::ed25519::PublicKey(node_key.0).to_string();
+                    quorum_info.insert(node_id, hex::encode(qset_hash.0));
+                }
+                let entries: Vec<_> = quorum_info.into_iter().collect();
+                conn.save_quorum_info(&entries)?;
+            }
+
             conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &has_json)?;
             conn.set_last_closed_ledger(self.header.ledger_seq)?;
             // Clear any stale catchup persist sentinel (AUDIT-226).
