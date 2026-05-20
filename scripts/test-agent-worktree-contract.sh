@@ -432,6 +432,45 @@ test_review_pr_validate_worktree_base_at_bootstrap() {
   fi
 }
 
+test_review_pr_validate_worktree_base_rejects_wrong_pr() {
+  local desc="review-pr validate_worktree_base rejects wrong PR number"
+
+  # The validator must accept a second argument (PR number) and, when provided,
+  # reject paths that belong to a different PR. This prevents concurrent reviews
+  # from accidentally sharing or deleting another PR's workspace.
+  local func_body
+  func_body=$(sed -n '/^validate_worktree_base()/,/^}/p' "$REVIEW_PR_SKILL")
+
+  # Check that the function accepts a second parameter for PR number
+  local has_pr_param=false
+  if echo "$func_body" | grep -qE 'expected_pr|pr_num|PR_NUM|\$2|\{2'; then
+    has_pr_param=true
+  fi
+
+  # Check that when PR number is provided, validation is PR-specific
+  # (rejects pr-*-review generically and requires the exact PR number)
+  local has_pr_specific_check=false
+  if echo "$func_body" | grep -qE 'pr-.*expected_pr.*-review|pr-"\$expected_pr"-review|pr-\$\{?expected_pr'; then
+    has_pr_specific_check=true
+  fi
+
+  # The bootstrap call must pass $PR_NUM to validate_worktree_base
+  local bootstrap_passes_pr=false
+  if grep -q 'validate_worktree_base "\$WORKTREE_BASE" "\$PR_NUM"' "$REVIEW_PR_SKILL"; then
+    bootstrap_passes_pr=true
+  fi
+
+  if $has_pr_param && $has_pr_specific_check && $bootstrap_passes_pr; then
+    tap_ok "$desc"
+  else
+    local reason=""
+    $has_pr_param || reason="validate_worktree_base does not accept a PR number parameter"
+    $has_pr_specific_check || reason="${reason:+$reason; }no PR-specific path check found"
+    $bootstrap_passes_pr || reason="${reason:+$reason; }bootstrap call does not pass \$PR_NUM to validator"
+    tap_not_ok "$desc" "$reason"
+  fi
+}
+
 # --------------------------------------------------------------------------
 # Run all tests
 # --------------------------------------------------------------------------
@@ -450,6 +489,7 @@ test_review_pr_reviewer_scratch_dirs
 test_review_pr_validate_worktree_base_safety
 test_review_pr_validate_worktree_base_rejects_traversal
 test_review_pr_validate_worktree_base_at_bootstrap
+test_review_pr_validate_worktree_base_rejects_wrong_pr
 test_claude_review_pr_synced
 test_claude_plan_synced
 

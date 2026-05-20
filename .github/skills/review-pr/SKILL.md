@@ -159,8 +159,11 @@ WORKTREE_BASE="${WORKTREE_BASE:-$HOME/data/$SESSION_ID/pr-$PR_NUM-review}"
 # Safety: validate WORKTREE_BASE is under $HOME/data/ and matches expected layout.
 # Reject overly broad paths that could cause catastrophic deletion on cleanup.
 # Called at bootstrap (before mkdir/export) AND before every rm -rf on exit paths.
+# Usage: validate_worktree_base <path> [<pr_number>]
+# When <pr_number> is supplied, the path must match that specific PR (not any PR).
 validate_worktree_base() {
   local base="$1"
+  local expected_pr="${2:-}"
 
   # Reject path traversal components before any resolution — prevents escaping
   # ~/data/ even when the target directory does not yet exist.
@@ -186,6 +189,18 @@ validate_worktree_base() {
     echo "FATAL: WORKTREE_BASE='$resolved' is too broad; refusing rm -rf" >&2
     return 1
   fi
+
+  # When a specific PR number is provided, only accept paths for that PR.
+  # This prevents a stale/leaked WORKTREE_BASE from one PR accidentally
+  # targeting another PR's workspace during concurrent reviews.
+  if [ -n "$expected_pr" ]; then
+    case "$resolved" in
+      "$HOME/data/"*/pr-"$expected_pr"-review) return 0 ;;
+      "$HOME/data/"*/review-pr-"$expected_pr") return 0 ;;
+      *) echo "FATAL: WORKTREE_BASE='$resolved' does not match current PR $expected_pr; expected \$HOME/data/<session>/pr-${expected_pr}-review" >&2; return 1 ;;
+    esac
+  fi
+
   case "$resolved" in
     "$HOME/data/"*/pr-*-review) return 0 ;;
     "$HOME/data/"*/review-pr-*) return 0 ;;
@@ -194,7 +209,8 @@ validate_worktree_base() {
 }
 
 # Validate WORKTREE_BASE immediately — fail early if an override points outside ~/data.
-validate_worktree_base "$WORKTREE_BASE" || exit 1
+# Pass $PR_NUM so the validator rejects paths belonging to a different PR.
+validate_worktree_base "$WORKTREE_BASE" "$PR_NUM" || exit 1
 
 export CARGO_TARGET_DIR="$WORKTREE_BASE/cargo-target"
 mkdir -p "$WORKTREE_BASE/reviewer-a" "$WORKTREE_BASE/reviewer-b"
@@ -589,7 +605,7 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 # Clean up the reviewer workspace (Step 3.5 artifacts).
 # This is the primary fix for #2843 — ensures reviewer scratch state never
 # lingers on disk after /review-pr completes.
-if [ -n "$WORKTREE_BASE" ] && [ -d "$WORKTREE_BASE" ] && validate_worktree_base "$WORKTREE_BASE"; then
+if [ -n "$WORKTREE_BASE" ] && [ -d "$WORKTREE_BASE" ] && validate_worktree_base "$WORKTREE_BASE" "$PR_NUM"; then
   rm -rf "$WORKTREE_BASE"
 fi
 
@@ -638,7 +654,7 @@ Unassign yourself so the next tick re-picks this issue.
 
 ```bash
 # Clean up reviewer workspace before exiting (prevents stale artifacts on disk).
-if [ -n "$WORKTREE_BASE" ] && [ -d "$WORKTREE_BASE" ] && validate_worktree_base "$WORKTREE_BASE"; then
+if [ -n "$WORKTREE_BASE" ] && [ -d "$WORKTREE_BASE" ] && validate_worktree_base "$WORKTREE_BASE" "$PR_NUM"; then
   rm -rf "$WORKTREE_BASE"
 fi
 ```
@@ -670,7 +686,7 @@ Move state and unassign:
 
 ```bash
 # Clean up reviewer workspace before exiting (prevents stale artifacts on disk).
-if [ -n "$WORKTREE_BASE" ] && [ -d "$WORKTREE_BASE" ] && validate_worktree_base "$WORKTREE_BASE"; then
+if [ -n "$WORKTREE_BASE" ] && [ -d "$WORKTREE_BASE" ] && validate_worktree_base "$WORKTREE_BASE" "$PR_NUM"; then
   rm -rf "$WORKTREE_BASE"
 fi
 
@@ -720,7 +736,7 @@ Move state:
 
 ```bash
 # Clean up reviewer workspace before exiting (prevents stale artifacts on disk).
-if [ -n "$WORKTREE_BASE" ] && [ -d "$WORKTREE_BASE" ] && validate_worktree_base "$WORKTREE_BASE"; then
+if [ -n "$WORKTREE_BASE" ] && [ -d "$WORKTREE_BASE" ] && validate_worktree_base "$WORKTREE_BASE" "$PR_NUM"; then
   rm -rf "$WORKTREE_BASE"
 fi
 
@@ -759,7 +775,7 @@ in Step 3.5):
 ```bash
 SESSION_ID="${CLAUDE_SESSION_ID:-$(date +%Y%m%d-%H%M%S)}"
 WORKTREE_BASE="${WORKTREE_BASE:-$HOME/data/$SESSION_ID/pr-$PR_NUM-review}"
-validate_worktree_base "$WORKTREE_BASE" || exit 1   # fail early on bad override
+validate_worktree_base "$WORKTREE_BASE" "$PR_NUM" || exit 1   # fail early on bad override
 export CARGO_TARGET_DIR="$WORKTREE_BASE/cargo-target"
 ```
 
