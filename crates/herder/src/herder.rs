@@ -2495,38 +2495,58 @@ impl Herder {
             // sequence before the non-validator early return (HerderImpl.cpp:1546-1573,
             // 1616-1620). Only report ObserverBuilt if the tx-set was actually
             // built and cached; propagate error if build_nomination_value aborts.
+            let cache_before = self.scp_driver.tx_set_cache_size();
             let build_result = self.build_nomination_value();
             let build_value_ms = t0.elapsed().as_millis();
 
             self.process_ready_fetching_envelopes();
 
-            if build_result.is_some() {
+            // Parity: stellar-core re-reads LCL after build and returns when
+            // `ledgerSeqToTrigger != slotIndex` before the non-validator early
+            // return (HerderImpl.cpp:1559-1562). Mirror the same post-build
+            // stale recheck so an observer trigger that races with close_ledger
+            // reports SkippedStale instead of incorrectly claiming success.
+            if !self.lcl_matches_slot(slot) {
+                tracing::warn!(
+                    requested_slot = slot,
+                    "Observer: skipping — LCL advanced during build_nomination_value"
+                );
+                return Ok(TriggerOutcome::SkippedStale);
+            }
+
+            // Determine success by whether the tx-set cache actually grew.
+            // build_nomination_value returns None both on genuine pre-cache
+            // failures (snapshot, self-validation) AND on the expected observer
+            // path where signing fails due to missing secret_key. The cache
+            // count distinguishes these: the cache grows only after
+            // validate_and_cache_built_tx_set succeeds (step 3.5 inside
+            // build_nomination_value).
+            let cache_after = self.scp_driver.tx_set_cache_size();
+            if cache_after > cache_before {
                 tracing::debug!(
                     slot,
                     build_value_ms,
                     "Observer trigger: built and cached tx-set without nominating"
                 );
                 return Ok(TriggerOutcome::ObserverBuilt);
-            } else {
-                // build_nomination_value returns None when the observer has no
-                // signing key (expected) OR on real failures (snapshot, validation).
-                // For observers without a signing key, the tx-set cache is still
-                // populated as a side-effect before the signing step fails.
-                // Check: if we have no secret key, the cache was populated —
-                // this is the expected non-validator path.
-                if self.secret_key.is_none() {
-                    tracing::debug!(
-                        slot,
-                        build_value_ms,
-                        "Observer trigger: no signing key, tx-set cache populated"
-                    );
-                    return Ok(TriggerOutcome::ObserverBuilt);
-                }
-                // Genuine pre-cache failure — report error.
-                return Err(HerderError::Internal(
-                    "Observer trigger: build_nomination_value failed before cache".into(),
-                ));
             }
+
+            // Cache did not grow — genuine pre-cache failure.
+            if build_result.is_some() {
+                // build_result is Some means signing succeeded too (unexpected
+                // for an observer) — still report success since cache must have
+                // been populated (validate_and_cache runs before signing).
+                tracing::debug!(
+                    slot,
+                    build_value_ms,
+                    "Observer trigger: full build succeeded"
+                );
+                return Ok(TriggerOutcome::ObserverBuilt);
+            }
+
+            return Err(HerderError::Internal(
+                "Observer trigger: build_nomination_value failed before cache".into(),
+            ));
         }
 
         let value = self
@@ -13265,11 +13285,12 @@ mod issue_2819_spec_adherence_tests {
             is_validator: false,
             ..HerderConfig::default()
         };
-        Herder::new(
-            config,
-            make_ledger_manager_at_seq(0),
-            TimerManagerHandle::no_op(),
-        )
+        let lm = make_ledger_manager_at_seq(0);
+        // Protocol 24 requires Soroban config for self-validation during
+        // build_nomination_value. Without it, validate_and_cache_built_tx_set
+        // fails with SOROBAN_CONFIG_UNAVAILABLE.
+        lm.set_soroban_network_info_for_test(henyey_ledger::SorobanNetworkInfo::default());
+        Herder::new(config, lm, TimerManagerHandle::no_op())
     }
 
     fn make_validator_herder_with_lm(ledger_seq: u32) -> (Herder, SecretKey) {
