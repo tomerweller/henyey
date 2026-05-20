@@ -2,8 +2,8 @@
 
 **Spec version:** 26 (stellar-core v26.0.1 / Protocol 26)
 **Crate:** crates/history (with crates/historywork)
-**Last updated:** 2026-05-13
-**Overall adherence:** 91% (Full 67 | Partial 5 | Absent 1 | Drift 1 | N/A 7)
+**Last updated:** 2026-05-20
+**Overall adherence:** 91% (Full 66 | Partial 5 | Absent 1 | Drift 1 | N/A 7)
 
 Sections §7 (LedgerApplyManager), §8.4 (apply-buffered drain),
 INV-C8, and INV-C12 live in `crates/app` — they are marked N/A here
@@ -29,10 +29,10 @@ invariants. INV-C9 (bucket-apply newest-wins) lives in
 | §4.4 | `MAX_HISTORY_ARCHIVE_BUCKET_SIZE = 100 GB` | Full | `archive_state.rs:23`, enforced at `catchup/download.rs:230` |
 | §4.5 | BucketList hash computation | Full | `archive_state.rs:600-654` |
 | §5.1–§5.2 | CheckpointBuilder dirty→final rename | Full | `checkpoint_builder.rs:344-481` |
-| §5.3 | HAS publish queue | Full | `publish_queue.rs` |
+| §5.3 | HAS publish queue | Drift | `publish_queue.rs` — documented intentional implementation difference (see §5.3 drift item below) |
 | §5.4 | MAX_PUBLISH_DELETE_CHECKPOINTS=100, delete_published_files | Full | `publish.rs:71-124` |
 | §5.5 | Differing-buckets diff algorithm | Full | `archive_state.rs:220-274` |
-| §5.6 | Publish queue backpressure (8/16) | Full | `publish_queue.rs:63-67`, `catchup/replay.rs:559-585` |
+| §5.6 | Publish queue backpressure (8/16) | Full | `publish_queue.rs:108-112`, `catchup/replay.rs:559-585` |
 | §5.7 | restoreCheckpoint / cleanup recovery | Full | `checkpoint_builder.rs:491-680` |
 | §6.1 | Catchup modes (OFFLINE_BASIC/OFFLINE_COMPLETE/ONLINE) | Partial | only Minimal/Recent/Complete distinguished; OFFLINE/ONLINE not modelled |
 | §6.3 | calculateCatchupRange | Partial | `catchup_range.rs:221-319` — see Drift item below |
@@ -97,10 +97,10 @@ invariants. INV-C9 (bucket-apply newest-wins) lives in
 
 - **§5.1 incremental build**: `crates/history/src/checkpoint_builder.rs:344-437` — three dirty streams (ledger / transactions / results), `.dirty` suffix, fsync-on-write via `XdrStreamWriter`. **Full**.
 - **§5.2 finalization**: `checkpoint_builder.rs:444-481` — durable rename per file, parent dir create_dir_all. **Full**.
-- **§5.3 HAS queue**: `crates/history/src/publish_queue.rs` (SQLite-backed; spec describes file-backed `<seq>.checkpoint.dirty` / `<seq>.checkpoint`). **Drift item below**: storage shape differs from spec's "directory of `.checkpoint` files"; semantically equivalent (committed/pending discriminator) but on-disk layout is not byte-identical.
+- **§5.3 HAS queue**: `crates/history/src/publish_queue.rs` (SQLite-backed; spec describes file-backed `<seq>.checkpoint.dirty` / `<seq>.checkpoint`). **Documented intentional implementation difference**: storage shape differs from spec's filesystem queue, but the crash-recovery semantics are equivalent. The queue is node-local (never externally observable), so no behavioral divergence exists at the consensus or interoperability level — however, the on-disk representation differs for local tooling and manual inspection. Henyey's queue entries are committed atomically in the ledger-close DB transaction (no pending/dirty row state); stellar-core achieves the same via `writeCheckpointFile` + `maybeCheckpointComplete` rename. Restart cleanup (`db.remove_publish_above_lcl(lcl)`) mirrors `restoreCheckpoint()`. See `publish_queue.rs` module docs for the full semantic mapping.
 - **§5.4 upload + delete_published_files (max 100)**: `crates/history/src/publish.rs:71-124`. **Full**.
 - **§5.5 diff-buckets**: `crates/history/src/archive_state.rs:220-274`. **Full** — order matches spec ("snap, next-output, curr per level, top→bottom"), inhibit set seeded with all-zero hash.
-- **§5.6 backpressure 8/16**: `crates/history/src/publish_queue.rs:63-67`, `crates/history/src/catchup/replay.rs:559-585`. **Full**. Hysteresis verified at `catchup/replay.rs:568-572`; named tests `test_publish_queue_max_size_is_16`, `test_publish_queue_hysteresis_invariant` lock in the values.
+- **§5.6 backpressure 8/16**: `crates/history/src/publish_queue.rs:108-112`, `crates/history/src/catchup/replay.rs:559-585`. **Full**. Hysteresis verified at `catchup/replay.rs:568-572`; named tests `test_publish_queue_max_size_is_16`, `test_publish_queue_hysteresis_invariant` lock in the values.
 - **§5.7 crash recovery**: `crates/history/src/checkpoint_builder.rs:491-680`. **Full**. Recovers dirty files by truncating entries with `ledgerSeq > lcl`, durably renames back. The §5.7 "all three or none" partial-state rule is enforced by category-by-category cleanup loop.
 
 ### §6.1 — Catchup Modes
@@ -160,7 +160,7 @@ All constants present with correct values:
 - `MAX_HISTORY_ARCHIVE_BUCKET_SIZE = 100 * 1024^3` at `archive_state.rs:23`.
 - `FIRST_PROTOCOL_SHADOWS_REMOVED = 12` at `archive_state.rs:378`.
 - `GENESIS_LEDGER_SEQ = 1` at `catchup_range.rs:24`.
-- `PUBLISH_QUEUE_MAX_SIZE = 16`, `PUBLISH_QUEUE_UNBLOCK_APPLICATION = 8` at `publish_queue.rs:63-67`.
+- `PUBLISH_QUEUE_MAX_SIZE = 16`, `PUBLISH_QUEUE_UNBLOCK_APPLICATION = 8` at `publish_queue.rs:108-112`.
 - `MAX_DELETE_CHECKPOINTS = 100` at `publish.rs:71` (named `MAX_PUBLISH_DELETE_CHECKPOINTS` in spec — naming drift, value matches).
 - `FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION = 23`: not located as a named constant; logic at `publish.rs:295` (`version = if hot_archive_buckets.is_some() { 2 } else { 1 }`) is the structural equivalent. **Naming drift**, semantic Full.
 - `LIVE_BUCKETLIST_LEVELS = 11`: re-exported from `henyey_bucket::BUCKET_LIST_LEVELS`; same value.
@@ -184,7 +184,7 @@ All constants present with correct values:
 | INV-C8 (Buffered drain ordering) | N/A | Lives in `crates/app/src/app/ledger_close.rs:1758-1792` (`try_apply_buffered_ledgers` only advances `next_seq = current + 1`; gap stops the chain). |
 | INV-C9 (Bucket-apply newest wins) | N/A | Lives in `crates/bucket/src/bucket_list.rs:1969-1989` and `crates/bucket/src/manager.rs:850-890` (`seen_keys` HashSet, shallowest-first traversal). |
 | INV-C10 (Publish file finalization boundary) | Full | `checkpoint_builder.rs:444-481` rename happens only after caller passes the checkpoint ledger; `recover_dirty_file` (`:135-225`) truncates `ledgerSeq > lcl` on restart. |
-| INV-C11 (Publish queue durability) | Full | `publish_queue.rs` (SQLite-backed; row-level atomic); on restart, queue rows survive iff their transaction committed. Drift from spec's filename-based scheme is documented under §5.3. |
+| INV-C11 (Publish queue durability) | Full | `publish_queue.rs` (SQLite-backed; row-level atomic); on restart, queue rows survive iff their transaction committed. Storage shape differs from spec's filename-based scheme but provides equivalent crash-recovery semantics (documented intentional difference — see §5.3 drift item). |
 | INV-C12 (No retry on fatal) | N/A | Lives in `crates/app/src/app/mod.rs:557` (`fatal_state_failure: AtomicBool`); checked at `crates/app/src/app/ledger_close.rs:1801` and `crates/app/src/app/catchup_impl.rs:55,1642`. |
 | INV-C13 (Range exclusivity) | Full | `catchup_range.rs:155-208` enum encodes the three cases (`ReplayOnly` / `BucketApplyAndReplay` / `BucketsOnly`) at the type level; `buckets_and_replay` enforces `checkpoint + 1 == replay.first` via assert (line 202-206). |
 | INV-C14 (Replay determinism) | Full | Replay always goes through `ledger_manager.close_ledger()` (`catchup/replay.rs:516-531`), the same path as live close, with `expected_header_hash` propagated and verified (`catchup/replay.rs:489-501, 519-525`). Determinism property held by `crates/ledger`. |
@@ -202,7 +202,7 @@ All constants present with correct values:
 | `catchup/mod.rs:463` | §8.5 |
 | `catchup/replay.rs:472, 556` | §5.6, §11.4 |
 | `historywork/builder.rs:136, 147, 158` | §9.1 (retry policy) |
-| `publish_queue.rs:502, 510` | §5.6 |
+| `publish_queue.rs:541, 547` | §5.6 |
 
 No dangling anchors were detected — all cited sections exist in the regenerated v26.0.1 spec.
 
@@ -210,7 +210,7 @@ No dangling anchors were detected — all cited sections exist in the regenerate
 
 ## Drift Items (human review)
 
-1. **§5.3 HAS publish queue storage shape**: spec describes a filesystem of `<seq>.checkpoint` and `<seq>.checkpoint.dirty` files; Rust uses a SQLite `publishqueue` table (`publish_queue.rs`). The durability semantics are equivalent (transactional commit replaces durable rename), and the spec is informational (not part of consensus). **Recommend**: either update spec to acknowledge SQLite-backed queue as a conforming alternative, or restructure Rust to use the file-based shape for archive interoperability with stellar-core's queue. Since the queue is node-local and never exposed in archives, no behavioral divergence is observable to other nodes.
+1. **§5.3 HAS publish queue storage shape** *(Documented intentional difference)*: spec describes a filesystem of `<seq>.checkpoint` and `<seq>.checkpoint.dirty` files; Rust uses a SQLite `publishqueue` table (`publish_queue.rs`). The durability semantics are equivalent for crash-recovery purposes (transactional commit replaces durable rename), and the queue is node-local (never exposed in archives or externally observable). However, the on-disk storage shape still differs from the spec's filesystem model, which matters for local operational tooling, debugging, and manual inspection. **Documented in-repo** as an intentional implementation difference — see `publish_queue.rs` module docs, `README.md` design note, and `PARITY_STATUS.md` architectural difference #3. No code change required.
 
 2. **§6.3 Case 1 / post-#2677 invariant**: Rust collapses spec's five-case range computation into a slightly different factoring (Case 0 for Complete-from-genesis, Case 1 unconditional replay when LCL > genesis, Case 4b for first-checkpoint targets). The factoring is documented at `catchup_range.rs:240-262` and stated to match stellar-core CatchupRange.cpp:52-57 exactly. **Not a true drift — request a spec-side update to make the factoring explicit, citing PR #2677.**
 
@@ -221,5 +221,5 @@ No dangling anchors were detected — all cited sections exist in the regenerate
 1. **Add OFFLINE_BASIC / OFFLINE_COMPLETE / ONLINE mode discriminator** to `CatchupMode` (or a sibling enum). Wire OFFLINE_COMPLETE to a `verify_results_for_range` work that loops over `results-*.xdr.gz` files for every checkpoint in the replay range, invoking `verify_tx_result_set` per ledger. Closes the §12 / INV-C6 gap.
 2. **Plumb SCP-side trusted hash through** to `catchup/replay.rs:235` so `TrustSource::Scp` is actually exercised in ONLINE mode. Closes the INV-C5 gap (currently relies on internal-only chain consistency).
 3. **Add a `REBUILD_FOR_OFFER_TABLE`-equivalent persistent-state flag** (henyey-db row) cleared by the same code that calls `setLastClosedLedger` at the end of bucket apply. Closes the §14.5 gap.
-4. **Update spec §5.3** to acknowledge SQLite-backed publish queue as a conforming alternative storage shape (or vice versa, if filesystem-backed is required for stellar-core interoperability).
+4. ~~**Update spec §5.3** to acknowledge SQLite-backed publish queue as a conforming alternative storage shape (or vice versa, if filesystem-backed is required for stellar-core interoperability).~~ *(No spec update needed — documented in-repo as intentional implementation difference; queue is node-local. Tracked as Drift 1 above.)*
 5. **Update spec §6.3** to make the post-#2677 collapsed factoring of Case 1 / Case 2 / Case 4b explicit, eliminating the apparent drift.

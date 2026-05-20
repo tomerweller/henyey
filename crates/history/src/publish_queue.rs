@@ -4,16 +4,57 @@
 //! Checkpoints are persisted to the database before publishing, allowing
 //! publication to resume after a crash or restart.
 //!
-//! # Overview
+//! # Design: SQLite queue vs stellar-core filesystem queue
 //!
-//! When a validator closes a checkpoint ledger, it:
+//! stellar-core uses a filesystem-based publish queue where each pending
+//! checkpoint is represented by a pair of files in a queue directory:
+//! - `<seq>.checkpoint.dirty` — written by `writeCheckpointFile(..., false)`
+//!   in `publishQueuePath()` when the checkpoint is first queued.
+//! - `<seq>.checkpoint` — renamed from `.dirty` by `maybeCheckpointComplete()`
+//!   once the checkpoint XDR files are fully written.
+//! - `restoreCheckpoint()` iterates the queue directory on startup, removing
+//!   entries above the last-closed-ledger (LCL).
 //!
-//! 1. **Queues** the checkpoint with its HistoryArchiveState to the database
-//! 2. **Publishes** the checkpoint files to history archives
-//! 3. **Dequeues** the checkpoint after successful publication
+//! Henyey uses SQLite rows instead. This is an **intentional implementation
+//! choice** — the queue is node-local and never externally observable, so
+//! the storage shape has no consensus or interoperability implications.
+//! However, the on-disk representation differs from stellar-core's filesystem
+//! queue, which affects local operational tooling and manual inspection.
+//! The crash-recovery semantic equivalence is:
 //!
-//! If the node crashes between queueing and dequeuing, the checkpoint
-//! remains in the queue and will be published on restart.
+//! | stellar-core filesystem | henyey SQLite |
+//! |-------------------------|---------------|
+//! | File absent → not queued | Row absent → not queued |
+//! | `.dirty` file exists → pending (partially written) | *No analogue* — rows appear only on commit (see below) |
+//! | `.checkpoint` file exists → ready to publish | Row exists with HAS JSON → ready to publish |
+//! | `restoreCheckpoint()` removes files > LCL | `db.remove_publish_above_lcl(lcl)` removes rows > LCL |
+//!
+//! The key difference is that henyey has **no pending/dirty row state**.
+//! Queue entries are created atomically inside the ledger-close DB
+//! transaction (`conn.enqueue_publish(...)` in
+//! `crates/app/src/app/ledger_close.rs`). If the transaction rolls back,
+//! the row never existed. This replaces the two-phase `.dirty` → rename
+//! pattern with single-phase transactional commit — the database's ACID
+//! guarantees provide equivalent crash-recovery semantics to stellar-core's
+//! `fsync` + durable rename.
+//!
+//! # Recovery path split
+//!
+//! Crash recovery for the publish pipeline is split across two layers:
+//!
+//! - **Checkpoint XDR files** (`.dirty` streams for ledger headers,
+//!   transactions, results): recovered by [`CheckpointBuilder`] in
+//!   `crates/history/src/checkpoint_builder.rs`, which truncates entries
+//!   with `ledgerSeq > lcl` and durably renames back to final.
+//!
+//! - **Publish queue rows** (stale HAS snapshots above LCL): cleaned up by
+//!   `restore_checkpoint()` in `crates/app/src/app/ledger_close.rs` via
+//!   `db.remove_publish_above_lcl(lcl)` (which delegates to
+//!   `crates/db/src/queries/publish_queue.rs::remove_above_lcl()`).
+//!
+//! Together these two paths provide the same restart-safety guarantee as
+//! stellar-core's `restoreCheckpoint()`, which handles both filesystem
+//! queue entries and checkpoint stream files in a single pass.
 //!
 //! # Database Schema
 //!
@@ -27,6 +68,10 @@
 //! ```
 //!
 //! Where `state` contains the serialized `HistoryArchiveState` JSON.
+//! The `'pending'` literal in the `state` column is a legacy-compat value
+//! used by `crates/db/src/queries/publish_queue.rs` for entries that
+//! predate the HAS-JSON storage; it is not part of the normal runtime
+//! queue model.
 //!
 //! # Usage
 //!
